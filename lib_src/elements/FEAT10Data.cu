@@ -34,7 +34,7 @@ __global__ void build_mass_keys_feat10_kernel(GPU_FEAT10_Data *d_data,
                                               unsigned long long *d_keys) {
   const int total = d_data->gpu_n_elem() * Quadrature::N_NODE_T10_10 *
                     Quadrature::N_NODE_T10_10;
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int tid         = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= total) {
     return;
   }
@@ -204,6 +204,28 @@ __global__ void dn_du_pre_kernel(GPU_FEAT10_Data *d_data) {
   }
 }
 
+// Exact consistent mass pattern of a straight-edged T10 element (standard
+// node order: corners 0-3, midsides of edges 01, 12, 02, 03, 13, 23).
+// m_ij = rho * V_E * C_ij / 420.
+__device__ double t10_mass_coeff(int i, int j) {
+  const int edges[6][2] = {{0, 1}, {1, 2}, {0, 2}, {0, 3}, {1, 3}, {2, 3}};
+  if (i < 4 && j < 4) {
+    return (i == j) ? 6.0 : 1.0;  // corner-corner
+  }
+  if (i >= 4 && j >= 4) {  // midside-midside
+    if (i == j)
+      return 32.0;
+    const int *a = edges[i - 4];
+    const int *b = edges[j - 4];
+    const bool share =
+        a[0] == b[0] || a[0] == b[1] || a[1] == b[0] || a[1] == b[1];
+    return share ? 16.0 : 8.0;
+  }
+  const int corner = (i < 4) ? i : j;  // corner-midside
+  const int *e     = edges[((i < 4) ? j : i) - 4];
+  return (corner == e[0] || corner == e[1]) ? -4.0 : -6.0;
+}
+
 __global__ void mass_matrix_qp_kernel(GPU_FEAT10_Data *d_data) {
   int n_qp_per_elem = Quadrature::N_QP_T10_5;  // 5 quadrature points
   int thread_global = blockIdx.x * blockDim.x + threadIdx.x;
@@ -215,57 +237,49 @@ __global__ void mass_matrix_qp_kernel(GPU_FEAT10_Data *d_data) {
   if (elem >= d_data->gpu_n_elem())
     return;
 
-  // Decode item_local into (i_local, j_local) node indices
   int i_local = item_local / 10;  // Local node i (0-9)
   int j_local = item_local % 10;  // Local node j (0-9)
 
-  // Get global node indices
   int i_global = d_data->element_connectivity()(elem, i_local);
   int j_global = d_data->element_connectivity()(elem, j_local);
 
-  // Get material density
   double rho = d_data->rho0(elem);
 
-  // Accumulator for this (i, j) pair across all QPs
+  // Straight-edged element <=> detJ is identical at every quadrature point.
+  const double detJ0 = d_data->detJ_ref(elem, 0);
+  bool straight      = true;
+  for (int qp = 1; qp < n_qp_per_elem; qp++) {
+    if (fabs(d_data->detJ_ref(elem, qp) - detJ0) > 1e-12 * fabs(detJ0)) {
+      straight = false;
+    }
+  }
+
   double mass_contribution = 0.0;
+  if (straight) {
+    // Exact closed form: V_E = detJ / 6.
+    mass_contribution =
+        rho * (detJ0 / 6.0) * t10_mass_coeff(i_local, j_local) / 420.0;
+  } else {
+    // Curved element: keep the original 5-point quadrature.
+    for (int qp = 0; qp < n_qp_per_elem; qp++) {
+      double xi   = d_data->tet5pt_x(qp);
+      double eta  = d_data->tet5pt_y(qp);
+      double zeta = d_data->tet5pt_z(qp);
+      double wq   = d_data->tet5pt_weights(qp);
 
-  // Loop over all quadrature points
-  for (int qp = 0; qp < n_qp_per_elem; qp++) {
-    // Get quadrature point coordinates
-    double xi   = d_data->tet5pt_x(qp);
-    double eta  = d_data->tet5pt_y(qp);
-    double zeta = d_data->tet5pt_z(qp);
-    double wq   = d_data->tet5pt_weights(qp);
-    // printf("xi: %f, eta: %f, zeta: %f, wq: %f\n", xi, eta, zeta, wq);
+      double L[4] = {1.0 - xi - eta - zeta, xi, eta, zeta};
+      double N[10];
+      for (int k = 0; k < 4; k++) {
+        N[k] = L[k] * (2.0 * L[k] - 1.0);
+      }
+      int edges[6][2] = {{0, 1}, {1, 2}, {0, 2}, {0, 3}, {1, 3}, {2, 3}};
+      for (int k = 0; k < 6; k++) {
+        N[k + 4] = 4.0 * L[edges[k][0]] * L[edges[k][1]];
+      }
 
-    // Compute barycentric coordinates
-    double L1   = 1.0 - xi - eta - zeta;
-    double L2   = xi;
-    double L3   = eta;
-    double L4   = zeta;
-    double L[4] = {L1, L2, L3, L4};
-
-    // Compute shape functions
-    double N[10];
-
-    // Corner nodes (0-3)
-    for (int k = 0; k < 4; k++) {
-      N[k] = L[k] * (2.0 * L[k] - 1.0);
+      double detJ = d_data->detJ_ref(elem, qp);
+      mass_contribution += rho * N[i_local] * N[j_local] * detJ * wq;
     }
-
-    // Edge nodes (4-9)
-    int edges[6][2] = {{0, 1}, {1, 2}, {0, 2}, {0, 3}, {1, 3}, {2, 3}};
-    for (int k = 0; k < 6; k++) {
-      int ii   = edges[k][0];
-      int jj   = edges[k][1];
-      N[k + 4] = 4.0 * L[ii] * L[jj];
-    }
-
-    // Get determinant (pre-computed)
-    double detJ = d_data->detJ_ref(elem, qp);
-
-    // Accumulate: rho * N[i] * N[j] * detJ * wq
-    mass_contribution += rho * N[i_local] * N[j_local] * detJ * wq;
   }
 
   const int row_start = d_data->csr_offsets()[i_global];
@@ -314,7 +328,8 @@ void GPU_FEAT10_Data::CalcP() {
 
 __global__ void compute_von_mises_kernel(GPU_FEAT10_Data *d_data) {
   int elem_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (elem_idx >= d_data->gpu_n_elem()) return;
+  if (elem_idx >= d_data->gpu_n_elem())
+    return;
   compute_element_von_mises(elem_idx, d_data);
 }
 
@@ -354,7 +369,7 @@ void GPU_FEAT10_Data::CalcConstraintData() {
   if (n_constraint == 0) {
     return;
   }
-  int total_threads = GetConstraintEvalThreadCount();
+  int total_threads     = GetConstraintEvalThreadCount();
   int threads_per_block = 128;
   int blocks = (total_threads + threads_per_block - 1) / threads_per_block;
 
@@ -552,13 +567,14 @@ __global__ void build_general_constraint_jacobian_values_kernel(
   }
 
   const int term_begin = d_data->general_constraint_term_offset(constraint_idx);
-  const int term_end = d_data->general_constraint_term_offset(constraint_idx + 1);
+  const int term_end =
+      d_data->general_constraint_term_offset(constraint_idx + 1);
   for (int term_idx = term_begin; term_idx < term_end; ++term_idx) {
-    const int j_index = d_data->general_constraint_term_j_index(term_idx);
+    const int j_index  = d_data->general_constraint_term_j_index(term_idx);
     const int jt_index = d_data->general_constraint_term_jt_index(term_idx);
     const int dof_component = d_data->j_csr_columns()[j_index] % 3;
 
-    double value = d_data->general_constraint_term_scale(term_idx);
+    double value        = d_data->general_constraint_term_scale(term_idx);
     const int term_kind = d_data->general_constraint_term_kind(term_idx);
     if (term_kind == kFEAT10ConstraintTermUsesA) {
       value *= a[dof_component];
@@ -584,17 +600,18 @@ void GPU_FEAT10_Data::ConvertToCSR_ConstraintJac() {
     }
     int h_j_nnz  = 0;
     int h_cj_nnz = 0;
-    HANDLE_ERROR(cudaMemcpy(&h_j_nnz, d_j_nnz, sizeof(int),
-                            cudaMemcpyDeviceToHost));
-    HANDLE_ERROR(cudaMemcpy(&h_cj_nnz, d_cj_nnz, sizeof(int),
-                            cudaMemcpyDeviceToHost));
+    HANDLE_ERROR(
+        cudaMemcpy(&h_j_nnz, d_j_nnz, sizeof(int), cudaMemcpyDeviceToHost));
+    HANDLE_ERROR(
+        cudaMemcpy(&h_cj_nnz, d_cj_nnz, sizeof(int), cudaMemcpyDeviceToHost));
     HANDLE_ERROR(cudaMemset(d_j_csr_values, 0,
                             static_cast<size_t>(h_j_nnz) * sizeof(double)));
     HANDLE_ERROR(cudaMemset(d_cj_csr_values, 0,
                             static_cast<size_t>(h_cj_nnz) * sizeof(double)));
     constexpr int threads = 256;
     const int blocks      = (n_constraint + threads - 1) / threads;
-    build_general_constraint_jacobian_values_kernel<<<blocks, threads>>>(d_data);
+    build_general_constraint_jacobian_values_kernel<<<blocks, threads>>>(
+        d_data);
     HANDLE_ERROR(cudaDeviceSynchronize());
     return;
   }
@@ -642,17 +659,18 @@ void GPU_FEAT10_Data::ConvertToCSR_ConstraintJacT() {
     }
     int h_j_nnz  = 0;
     int h_cj_nnz = 0;
-    HANDLE_ERROR(cudaMemcpy(&h_j_nnz, d_j_nnz, sizeof(int),
-                            cudaMemcpyDeviceToHost));
-    HANDLE_ERROR(cudaMemcpy(&h_cj_nnz, d_cj_nnz, sizeof(int),
-                            cudaMemcpyDeviceToHost));
+    HANDLE_ERROR(
+        cudaMemcpy(&h_j_nnz, d_j_nnz, sizeof(int), cudaMemcpyDeviceToHost));
+    HANDLE_ERROR(
+        cudaMemcpy(&h_cj_nnz, d_cj_nnz, sizeof(int), cudaMemcpyDeviceToHost));
     HANDLE_ERROR(cudaMemset(d_j_csr_values, 0,
                             static_cast<size_t>(h_j_nnz) * sizeof(double)));
     HANDLE_ERROR(cudaMemset(d_cj_csr_values, 0,
                             static_cast<size_t>(h_cj_nnz) * sizeof(double)));
     constexpr int threads = 256;
     const int blocks      = (n_constraint + threads - 1) / threads;
-    build_general_constraint_jacobian_values_kernel<<<blocks, threads>>>(d_data);
+    build_general_constraint_jacobian_values_kernel<<<blocks, threads>>>(
+        d_data);
     HANDLE_ERROR(cudaDeviceSynchronize());
     return;
   }
@@ -911,20 +929,20 @@ void GPU_FEAT10_Data::RetrieveReferencePositionToCPU(Eigen::VectorXd &x_ref,
   z_ref.resize(total_nodes);
 
   HANDLE_ERROR(cudaMemcpy(x_ref.data(), d_h_x12_jac,
-                           total_nodes * sizeof(double),
-                           cudaMemcpyDeviceToHost));
+                          total_nodes * sizeof(double),
+                          cudaMemcpyDeviceToHost));
   HANDLE_ERROR(cudaMemcpy(y_ref.data(), d_h_y12_jac,
-                           total_nodes * sizeof(double),
-                           cudaMemcpyDeviceToHost));
+                          total_nodes * sizeof(double),
+                          cudaMemcpyDeviceToHost));
   HANDLE_ERROR(cudaMemcpy(z_ref.data(), d_h_z12_jac,
-                           total_nodes * sizeof(double),
-                           cudaMemcpyDeviceToHost));
+                          total_nodes * sizeof(double),
+                          cudaMemcpyDeviceToHost));
 }
 
 void GPU_FEAT10_Data::RetrieveVonMisesToCPU(Eigen::VectorXd &vm) {
   vm.resize(n_elem);
   HANDLE_ERROR(cudaMemcpy(vm.data(), d_vm_stress, n_elem * sizeof(double),
-                           cudaMemcpyDeviceToHost));
+                          cudaMemcpyDeviceToHost));
 }
 
 void GPU_FEAT10_Data::WriteOutputVTU(const std::string &filename) {
@@ -1005,7 +1023,8 @@ void GPU_FEAT10_Data::WriteOutputVTU(const std::string &filename) {
   for (int i = 0; i < n_cells; ++i) {
     for (int j = 0; j < Quadrature::N_NODE_T10_10; ++j) {
       out << connectivity(i, j);
-      if (j < Quadrature::N_NODE_T10_10 - 1) out << " ";
+      if (j < Quadrature::N_NODE_T10_10 - 1)
+        out << " ";
     }
     out << "\n";
   }
@@ -1035,9 +1054,9 @@ void GPU_FEAT10_Data::SetNodalFixed(const Eigen::VectorXi &fixed_nodes) {
     return;
   }
 
-  constraint_mode_ = kFEAT10ConstraintFixedNodes;
-  n_constraint = fixed_nodes.size() * 3;
-  n_general_dot_constraint = 0;
+  constraint_mode_                   = kFEAT10ConstraintFixedNodes;
+  n_constraint                       = fixed_nodes.size() * 3;
+  n_general_dot_constraint           = 0;
   n_general_nonlinear_dot_constraint = 0;
 
   HANDLE_ERROR(cudaMalloc(&d_constraint, n_constraint * sizeof(double)));
@@ -1062,9 +1081,9 @@ void GPU_FEAT10_Data::SetGeneralConstraints(
     return;
   }
 
-  n_constraint     = static_cast<int>(layout.scalars.size());
-  constraint_mode_ = kFEAT10ConstraintGeneral;
-  n_general_dot_constraint = 0;
+  n_constraint                       = static_cast<int>(layout.scalars.size());
+  constraint_mode_                   = kFEAT10ConstraintGeneral;
+  n_general_dot_constraint           = 0;
   n_general_nonlinear_dot_constraint = 0;
   if (n_constraint == 0) {
     return;
@@ -1079,13 +1098,12 @@ void GPU_FEAT10_Data::SetGeneralConstraints(
   std::vector<double> world_directions(static_cast<size_t>(n_constraint) * 3,
                                        0.0);
   std::vector<int> point_elements(static_cast<size_t>(n_constraint) * 4, -1);
-  std::vector<double> point_shapes(static_cast<size_t>(n_constraint) * 4 *
-                                       Quadrature::N_NODE_T10_10,
-                                   0.0);
+  std::vector<double> point_shapes(
+      static_cast<size_t>(n_constraint) * 4 * Quadrature::N_NODE_T10_10, 0.0);
 
   for (int i = 0; i < n_constraint; ++i) {
-    const auto &scalar = layout.scalars[static_cast<size_t>(i)];
-    types[static_cast<size_t>(i)]   = scalar.type;
+    const auto &scalar            = layout.scalars[static_cast<size_t>(i)];
+    types[static_cast<size_t>(i)] = scalar.type;
     if (scalar.type == kFEAT10ConstraintDP1 ||
         scalar.type == kFEAT10ConstraintDP2 ||
         scalar.type == kFEAT10ConstraintWorldDP1) {
@@ -1095,9 +1113,9 @@ void GPU_FEAT10_Data::SetGeneralConstraints(
         scalar.type == kFEAT10ConstraintDP2) {
       ++n_general_nonlinear_dot_constraint;
     }
-    axes[static_cast<size_t>(i)]    = scalar.axis;
-    nodes[static_cast<size_t>(i)]   = scalar.node_id;
-    targets[static_cast<size_t>(i)] = scalar.target;
+    axes[static_cast<size_t>(i)]       = scalar.axis;
+    nodes[static_cast<size_t>(i)]      = scalar.node_id;
+    targets[static_cast<size_t>(i)]    = scalar.target;
     row_scales[static_cast<size_t>(i)] = scalar.row_scale;
     for (int axis = 0; axis < 3; ++axis) {
       world_directions[static_cast<size_t>(i) * 3 + axis] =
@@ -1120,14 +1138,14 @@ void GPU_FEAT10_Data::SetGeneralConstraints(
   HANDLE_ERROR(cudaMemset(d_constraint, 0, n_constraint * sizeof(double)));
   d_fixed_nodes = nullptr;
 
-  HANDLE_ERROR(cudaMalloc(&d_general_constraint_types,
-                          n_constraint * sizeof(int)));
-  HANDLE_ERROR(cudaMalloc(&d_general_constraint_axes,
-                          n_constraint * sizeof(int)));
-  HANDLE_ERROR(cudaMalloc(&d_general_constraint_nodes,
-                          n_constraint * sizeof(int)));
-  HANDLE_ERROR(cudaMalloc(&d_general_constraint_targets,
-                          n_constraint * sizeof(double)));
+  HANDLE_ERROR(
+      cudaMalloc(&d_general_constraint_types, n_constraint * sizeof(int)));
+  HANDLE_ERROR(
+      cudaMalloc(&d_general_constraint_axes, n_constraint * sizeof(int)));
+  HANDLE_ERROR(
+      cudaMalloc(&d_general_constraint_nodes, n_constraint * sizeof(int)));
+  HANDLE_ERROR(
+      cudaMalloc(&d_general_constraint_targets, n_constraint * sizeof(double)));
   HANDLE_ERROR(cudaMalloc(&d_general_constraint_row_scales,
                           n_constraint * sizeof(double)));
   HANDLE_ERROR(cudaMalloc(&d_general_constraint_world_directions,
@@ -1159,42 +1177,34 @@ void GPU_FEAT10_Data::SetGeneralConstraints(
   HANDLE_ERROR(cudaMemcpy(d_general_constraint_row_scales, row_scales.data(),
                           row_scales.size() * sizeof(double),
                           cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_world_directions,
-                          world_directions.data(),
-                          world_directions.size() * sizeof(double),
-                          cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_point_elements,
-                          point_elements.data(),
-                          point_elements.size() * sizeof(int),
-                          cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_point_shapes,
-                          point_shapes.data(),
-                          point_shapes.size() * sizeof(double),
-                          cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_term_offsets,
-                          layout.term_offsets.data(),
-                          layout.term_offsets.size() * sizeof(int),
-                          cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_term_kinds,
-                          layout.term_kinds.data(),
-                          layout.term_kinds.size() * sizeof(int),
-                          cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_term_scales,
-                          layout.term_scales.data(),
-                          layout.term_scales.size() * sizeof(double),
-                          cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_term_j_indices,
-                          layout.term_j_indices.data(),
-                          layout.term_j_indices.size() * sizeof(int),
-                          cudaMemcpyHostToDevice));
-  HANDLE_ERROR(cudaMemcpy(d_general_constraint_term_jt_indices,
-                          layout.term_jt_indices.data(),
-                          layout.term_jt_indices.size() * sizeof(int),
-                          cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(
+      d_general_constraint_world_directions, world_directions.data(),
+      world_directions.size() * sizeof(double), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(
+      cudaMemcpy(d_general_constraint_point_elements, point_elements.data(),
+                 point_elements.size() * sizeof(int), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(
+      cudaMemcpy(d_general_constraint_point_shapes, point_shapes.data(),
+                 point_shapes.size() * sizeof(double), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(
+      d_general_constraint_term_offsets, layout.term_offsets.data(),
+      layout.term_offsets.size() * sizeof(int), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(
+      d_general_constraint_term_kinds, layout.term_kinds.data(),
+      layout.term_kinds.size() * sizeof(int), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(
+      d_general_constraint_term_scales, layout.term_scales.data(),
+      layout.term_scales.size() * sizeof(double), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(
+      d_general_constraint_term_j_indices, layout.term_j_indices.data(),
+      layout.term_j_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(
+      d_general_constraint_term_jt_indices, layout.term_jt_indices.data(),
+      layout.term_jt_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
 
   const int j_nnz = static_cast<int>(layout.j_columns.size());
-  HANDLE_ERROR(cudaMalloc(&d_j_csr_offsets,
-                          layout.j_offsets.size() * sizeof(int)));
+  HANDLE_ERROR(
+      cudaMalloc(&d_j_csr_offsets, layout.j_offsets.size() * sizeof(int)));
   HANDLE_ERROR(cudaMalloc(&d_j_csr_columns, j_nnz * sizeof(int)));
   HANDLE_ERROR(cudaMalloc(&d_j_csr_values, j_nnz * sizeof(double)));
   HANDLE_ERROR(cudaMalloc(&d_j_nnz, sizeof(int)));
@@ -1204,11 +1214,12 @@ void GPU_FEAT10_Data::SetGeneralConstraints(
   HANDLE_ERROR(cudaMemcpy(d_j_csr_columns, layout.j_columns.data(),
                           j_nnz * sizeof(int), cudaMemcpyHostToDevice));
   HANDLE_ERROR(cudaMemset(d_j_csr_values, 0, j_nnz * sizeof(double)));
-  HANDLE_ERROR(cudaMemcpy(d_j_nnz, &j_nnz, sizeof(int), cudaMemcpyHostToDevice));
+  HANDLE_ERROR(
+      cudaMemcpy(d_j_nnz, &j_nnz, sizeof(int), cudaMemcpyHostToDevice));
 
   const int jt_nnz = static_cast<int>(layout.jt_columns.size());
-  HANDLE_ERROR(cudaMalloc(&d_cj_csr_offsets,
-                          layout.jt_offsets.size() * sizeof(int)));
+  HANDLE_ERROR(
+      cudaMalloc(&d_cj_csr_offsets, layout.jt_offsets.size() * sizeof(int)));
   HANDLE_ERROR(cudaMalloc(&d_cj_csr_columns, jt_nnz * sizeof(int)));
   HANDLE_ERROR(cudaMalloc(&d_cj_csr_values, jt_nnz * sizeof(double)));
   HANDLE_ERROR(cudaMalloc(&d_cj_nnz, sizeof(int)));
@@ -1238,10 +1249,10 @@ void GPU_FEAT10_Data::UpdateNodalFixed(const Eigen::VectorXi &fixed_nodes) {
     return;
   }
 
-  constraint_mode_ = kFEAT10ConstraintFixedNodes;
-  n_general_dot_constraint = 0;
+  constraint_mode_                   = kFEAT10ConstraintFixedNodes;
+  n_general_dot_constraint           = 0;
   n_general_nonlinear_dot_constraint = 0;
-  int new_n_constraint = fixed_nodes.size() * 3;
+  int new_n_constraint               = fixed_nodes.size() * 3;
 
   // If constraints not set up yet, just call SetNodalFixed
   if (!is_constraints_setup) {
