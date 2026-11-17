@@ -20,8 +20,12 @@ Mesh construction
   * Each box is split into 6 tetrahedra along one body diagonal (Kuhn split).
     Using the same pattern in every box makes neighboring tets share faces
     exactly (conforming mesh).
-  * Boxes with y < 0 use the mirror image of the pattern used for y > 0, so
-    the mesh is exactly mirror-symmetric about y = 0 (ny must be even).
+  * Boxes with x < 0 and/or y < 0 use the mirror image of the pattern used
+    for x > 0, y > 0, so the mesh is exactly mirror-symmetric about both
+    x = 0 and y = 0 (nx and ny must be even). Symmetry about y = 0 keeps the
+    motion in the x-z plane; symmetry about x = 0 makes the response to +Fx
+    and -Fx exact mirror images (no artificial coupling of axial loads into
+    bending).
   * T10 midside nodes sit at exact edge midpoints and are shared between
     neighboring elements. All nodes live on a (2nx+1) x (2ny+1) x (2nz+1)
     lattice.
@@ -79,7 +83,7 @@ def parse_args():
     p.add_argument("--nz", type=int, default=20,
                    help="number of boxes along the length (default 20)")
     p.add_argument("--nx", type=int, default=2,
-                   help="number of boxes along x (default 2)")
+                   help="number of boxes along x, must be even (default 2)")
     p.add_argument("--ny", type=int, default=2,
                    help="number of boxes along y, must be even (default 2)")
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -140,13 +144,16 @@ def build_mesh(L, Sx, Sy, nz, nx, ny):
     elements = []
     for bz in range(nz):
         for by in range(ny):
-            mirrored = by < ny // 2          # box lies in y < 0
+            mirror_y = by < ny // 2          # box lies in y < 0
             for bx in range(nx):
+                mirror_x = bx < nx // 2      # box lies in x < 0
                 for tet in local_tets:
                     corners = []
                     for (dx, dy, dz) in tet:
-                        if mirrored:
-                            dy = 1 - dy      # mirror image of the pattern
+                        if mirror_x:
+                            dx = 1 - dx      # mirror image in x
+                        if mirror_y:
+                            dy = 1 - dy      # mirror image in y
                         corners.append(np.array(
                             [2 * (bx + dx), 2 * (by + dy), 2 * (bz + dz)]))
                     elements.append(corners)
@@ -281,17 +288,25 @@ def run_checks(nodes, elements, lattice, args, tip_nodes, weights, tip_area,
     check("boundary surface area", abs(bnd_area - a_exact) <= 1e-10 * a_exact,
           f"{bnd_area:.12e} vs exact {a_exact:.12e} m^2")
 
-    # 5. Exact mirror symmetry about y = 0 (nodes and elements).
+    # 5. Exact mirror symmetry about y = 0 and about x = 0.
     key_to_id = {tuple(l): i for i, l in enumerate(lattice)}
-    mirror = np.array([key_to_id.get((I, 2 * ny - J, K), -1)
-                       for (I, J, K) in lattice])
-    ok_nodes = np.all(mirror >= 0) and np.array_equal(
-        nodes[mirror], nodes * np.array([1.0, -1.0, 1.0]))
     elem_sets = {tuple(sorted(e[:4])) for e in elements}
-    mirrored_sets = {tuple(sorted(mirror[e[:4]])) for e in elements}
-    check("mirror symmetry about y = 0", ok_nodes and
-          elem_sets == mirrored_sets,
-          "every node and element has an exact mirror partner")
+
+    def mirror_map(flip):
+        m = np.array([key_to_id.get(flip(I, J, K), -1)
+                      for (I, J, K) in lattice])
+        return m
+
+    mirror = mirror_map(lambda I, J, K: (I, 2 * ny - J, K))      # y -> -y
+    mirror_x = mirror_map(lambda I, J, K: (2 * nx - I, J, K))    # x -> -x
+    for name, m, sign in [("y = 0", mirror, [1.0, -1.0, 1.0]),
+                          ("x = 0", mirror_x, [-1.0, 1.0, 1.0])]:
+        ok_nodes = np.all(m >= 0) and np.array_equal(
+            nodes[m], nodes * np.array(sign))
+        ok_elems = ok_nodes and (
+            {tuple(sorted(m[e[:4]])) for e in elements} == elem_sets)
+        check(f"mirror symmetry about {name}", ok_elems,
+              "every node and element has an exact mirror partner")
 
     # 6. Tip traction weights.
     check("tip weights sum to 1", abs(weights.sum() - 1.0) <= 1e-12,
@@ -380,6 +395,8 @@ def main():
         sys.exit("error: --nz, --nx, --ny must be at least 1")
     if a.ny % 2 != 0:
         sys.exit("error: --ny must be even for mirror symmetry about y = 0")
+    if a.nx % 2 != 0:
+        sys.exit("error: --nx must be even for mirror symmetry about x = 0")
 
     name = a.name or default_name(a)
     outdir = os.path.join(a.outdir, name)
