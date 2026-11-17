@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "finger_fom",
+    srcs = ["finger_fom.cc"],
+    copts = ["--std=c++17"],
+    linkopts = [
+        "-L/usr/local/cuda/lib64",
+        "-lcublas",
+        "-lcusparse",
+        "-lcudart",
+        "-lcudss",
+    ],
+    deps = [
+        "//lib_src/elements:FEAT10Data",
+        "//lib_src/solvers:FEAT10ConstraintManager",
+        "//lib_src/solvers:solvers_syncednewton",
+        "//lib_utils:cpu_utils",
+        "//lib_utils:cli_utils",
+        "@eigen//:eigen",
+    ],
+)
