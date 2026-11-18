@@ -21,6 +21,7 @@ import json
 import os
 
 import numpy as np
+import scipy.sparse as sps
 
 
 def read_indices(path):
@@ -28,17 +29,21 @@ def read_indices(path):
 
 
 def load_mass(path, n_nodes):
+    """Scalar mass matrix [m_ij] as a sparse matrix."""
     coo = np.loadtxt(path, comments="#")
-    m = np.zeros((n_nodes, n_nodes))
-    np.add.at(m, (coo[:, 0].astype(int), coo[:, 1].astype(int)), coo[:, 2])
-    return m
+    return sps.csr_matrix((coo[:, 2], (coo[:, 0].astype(int),
+                                       coo[:, 1].astype(int))),
+                          shape=(n_nodes, n_nodes))
 
 
 def mass_times(m, a):
     """(m kron I3) a for each row of a (rows = snapshots, layout x0,y0,z0,...)."""
     ns, nd = a.shape
     a3 = a.reshape(ns, nd // 3, 3)                 # (ns, n_nodes, 3)
-    return np.einsum("ij,sjc->sic", m, a3).reshape(ns, nd)
+    out = np.empty_like(a3)
+    for c in range(3):                             # x, y, z components
+        out[:, :, c] = (m @ a3[:, :, c].T).T
+    return out.reshape(ns, nd)
 
 
 def main():
@@ -75,7 +80,7 @@ def main():
         power = np.einsum("sk,sk->s", v[:, free], f_visc[:, free])
         print(f"2. viscous power v.f_v: min {power.min():.3e} W, "
               f"max {power.max():.3e} W "
-              f"({'OK, dissipative' if power.min() > -1e-12 * max(power.max(), 1e-300) else 'NEGATIVE values!'})")
+              f"({'OK, dissipative' if power.min() > -max(1e-12 * np.abs(power).max(), 1e-18) else 'NEGATIVE values!'})")
     else:
         print("1-2. skipped (run without --save_fint)")
 
